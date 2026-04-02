@@ -8,7 +8,8 @@
   },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "prospect": "ts-node prospector/index.ts"
+    "prospect": "ts-node prospector/index.ts",
+    "prospect:bairros": "ts-node prospector/index.ts restaurantes \"Vitória ES\" --bairros"
   },
   "repository": {
     "type": "git",

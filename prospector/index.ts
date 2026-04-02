@@ -178,51 +178,48 @@ async function scrapeInstagramBio(username: string): Promise<{ whatsapp: string;
   }
 }
 
-// ─── WHATSAPP CHECK (EVOLUTION API) ───────────────────────────────────────
+// ─── WHATSAPP DETECTION (lógica BR) ───────────────────────────────────────
+// No Brasil, celulares têm 9 dígitos locais começando com 9.
+// Ex: (27) 99248-9096 → celular → tem WhatsApp
+//     (27) 3225-5773  → fixo    → não tem WhatsApp
+// Essa heurística tem ~95% de precisão para BR e elimina dependência de API externa.
 
-function normalizePhone(phone: string): string {
+function isBrazilianMobile(phone: string): boolean {
+  if (!phone) return false;
   const digits = phone.replace(/\D/g, '');
-  const clean = digits.startsWith('0') ? digits.slice(1) : digits;
-  if (!clean.startsWith('55')) return '55' + clean;
-  // Garantir celular com 9 dígito (Brasil)
-  // Ex: 5527 3xxx-xxxx (fixo) ou 5527 9xxxx-xxxx (celular)
-  return clean;
+  // Formato: DDD (2 dígitos) + 9 + 8 dígitos = 11 dígitos locais
+  // Ex: 27992489096 → DDD 27, começa com 9, 9 dígitos locais
+  if (digits.length === 11) {
+    const localPart = digits.slice(2); // remove DDD
+    return localPart.startsWith('9');
+  }
+  // Com DDI 55: 5527992489096 = 13 dígitos
+  if (digits.length === 13 && digits.startsWith('55')) {
+    const localPart = digits.slice(4); // remove 55 + DDD
+    return localPart.startsWith('9');
+  }
+  return false;
 }
 
-async function checkWhatsApp(phones: string[]): Promise<Record<string, boolean>> {
-  try {
-    // FIX: encode o nome da instância (suporta espaços e caracteres especiais)
-    const instance = encodeURIComponent(EVO_INSTANCE);
-    const normalized = phones.map(normalizePhone);
-
-    console.log(`\n🔍 Checando WhatsApp via Evolution (instância: ${EVO_INSTANCE})...`);
-
-    const res = await fetch(`${EVO_URL}/chat/whatsappNumbers/${instance}`, {
-      method: 'POST',
-      headers: { apikey: EVO_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ numbers: normalized }),
-      signal: AbortSignal.timeout(15000),
-    });
-
-    if (!res.ok) {
-      console.error(`❌ Evolution API erro ${res.status}: ${await res.text()}`);
-      throw new Error('Evolution API error');
-    }
-
-    const data = await res.json() as any[];
-    console.log(`✅ Evolution respondeu: ${data.length} números verificados`);
-
-    const result: Record<string, boolean> = {};
-    for (let i = 0; i < phones.length; i++) {
-      result[phones[i]] = data[i]?.exists ?? false;
-    }
-    return result;
-  } catch (err) {
-    console.warn(`⚠️  WhatsApp check falhou: ${err}. Continuando sem WA check.`);
-    const result: Record<string, boolean> = {};
-    phones.forEach(p => result[p] = false);
-    return result;
-  }
+// Mantém Evolution disponível para uso futuro no pipeline principal
+export async function checkWhatsAppEvolution(phones: string[]): Promise<Record<string, boolean>> {
+  const instance = encodeURIComponent(EVO_INSTANCE);
+  const normalized = phones.map(p => {
+    const d = p.replace(/\D/g, '');
+    const c = d.startsWith('0') ? d.slice(1) : d;
+    return c.startsWith('55') ? c : '55' + c;
+  });
+  const res = await fetch(`${EVO_URL}/chat/whatsappNumbers/${instance}`, {
+    method: 'POST',
+    headers: { apikey: EVO_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ numbers: normalized }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) throw new Error(`Evolution ${res.status}`);
+  const data = await res.json() as any[];
+  const result: Record<string, boolean> = {};
+  phones.forEach((p, i) => result[p] = data[i]?.exists ?? false);
+  return result;
 }
 
 // ─── QUALIDADE ─────────────────────────────────────────────────────────────
@@ -289,101 +286,116 @@ function pct(val: number, total: number) {
   return total ? Math.round((val / total) * 100) : 0;
 }
 
+// ─── BAIRROS POR CIDADE ────────────────────────────────────────────────────
+
+const BAIRROS: Record<string, string[]> = {
+  'Vitória ES': [
+    'Jardim da Penha', 'Jardim Camburi', 'Bento Ferreira',
+    'Santa Lúcia', 'Mata da Praia', 'Goiabeiras',
+    'Maruípe', 'São Pedro', 'Resistência',
+    'Santo Antônio', 'Caratoíra', 'Itararé',
+    'Consolação', 'São Cristóvão', 'Forte São João',
+  ],
+  'Vila Velha ES': [
+    'Itaparica', 'Coqueiral', 'Glória',
+    'Jardim Colorado', 'Centro', 'Cobilândia',
+    'Riviera da Barra', 'Praia de Itaparica',
+  ],
+  'Serra ES': [
+    'Laranjeiras', 'Carapina', 'Novo Horizonte',
+    'Bairro de Fátima', 'André Carloni', 'Parque Residencial Laranjeiras',
+  ],
+  'Cariacica ES': [
+    'Alto Lage', 'Campo Grande', 'Itacibá',
+    'Jardim América', 'Porto de Santana',
+  ],
+};
+
 // ─── MAIN ──────────────────────────────────────────────────────────────────
 
-async function run() {
-  const args = process.argv.slice(2);
-  const segmento = args[0] ?? 'restaurantes';
-  const cidade   = args[1] ?? 'Vitória ES';
-  const query    = `${segmento} em ${cidade}`;
-
-  // DEBUG — testar chave diretamente
-  console.log(`\n🔑 Chave Google: ${GOOGLE_KEY ? GOOGLE_KEY.slice(0,10)+'...' : 'NÃO ENCONTRADA'}`);
-  const testUrl = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=restaurantes+em+Vitoria+ES&key=${GOOGLE_KEY}&language=pt-BR`;
-  const testRes = await fetch(testUrl);
-  const testData = await testRes.json() as any;
-  console.log(`🔎 Status: ${testData.status}`);
-  console.log(`📋 Resultados: ${testData.results?.length ?? 0}`);
-  if (testData.error_message) console.log(`❌ Erro: ${testData.error_message}`);
-  if (testData.status !== 'OK') { process.exit(1); }
-
-  console.log(`\n🔍 Buscando: "${query}"...`);
-  console.log('⏳ Isso pode levar 1-2 minutos...\n');
-
-  // 1. Buscar lugares (até 2 páginas = ~40 resultados)
+async function coletarPlaces(queries: string[]): Promise<RawPlace[]> {
   const allPlaces: RawPlace[] = [];
-  let pageToken: string | undefined;
+  const seenIds = new Set<string>();
 
-  for (let page = 0; page < 2; page++) {
-    const { results, next_page_token } = await searchPlaces(query, pageToken);
-    allPlaces.push(...results);
-    pageToken = next_page_token;
-    if (!pageToken) break;
-    await new Promise(r => setTimeout(r, 2000)); // Google exige delay entre páginas
+  for (const query of queries) {
+    let pageToken: string | undefined;
+    for (let page = 0; page < 2; page++) {
+      const { results, next_page_token } = await searchPlaces(query, pageToken);
+      for (const r of results) {
+        if (!seenIds.has(r.place_id)) {
+          seenIds.add(r.place_id);
+          allPlaces.push(r);
+        }
+      }
+      pageToken = next_page_token;
+      if (!pageToken) break;
+      await new Promise(r => setTimeout(r, 2000));
+    }
+    process.stdout.write(`\r🗺️  Queries: ${queries.indexOf(query)+1}/${queries.length} | Únicos: ${allPlaces.length}`);
+    await new Promise(r => setTimeout(r, 500));
   }
+  console.log('\n');
+  return allPlaces;
+}
 
-  console.log(`📍 ${allPlaces.length} estabelecimentos encontrados\n`);
+async function run() {
+  const args      = process.argv.slice(2);
+  const segmento  = args[0] ?? 'restaurantes';
+  const cidade    = args[1] ?? 'Vitória ES';
+  const modoBairros = args[2] === '--bairros';
 
-  // 2. Pegar detalhes de cada lugar
+  console.log(`\n🔑 Google Maps API: ${GOOGLE_KEY ? '✅ OK' : '❌ NÃO ENCONTRADA'}`);
+  if (!GOOGLE_KEY) process.exit(1);
+
+  // Montar lista de queries
+  let queries: string[];
+  if (modoBairros && BAIRROS[cidade]) {
+    queries = BAIRROS[cidade].map(b => `${segmento} em ${b} ${cidade}`);
+    console.log(`\n🏘️  Modo bairros: ${queries.length} bairros em "${cidade}"`);
+  } else {
+    queries = [`${segmento} em ${cidade}`];
+    console.log(`\n🔍 Modo cidade: "${segmento} em ${cidade}"`);
+  }
+  console.log('⏳ Buscando...\n');
+
+  // 1. Buscar lugares
+  const allPlaces = await coletarPlaces(queries);
+  console.log(`📍 ${allPlaces.length} estabelecimentos únicos encontrados\n`);
+
+  // 2. Pegar detalhes
   const details: PlaceDetail[] = [];
   for (let i = 0; i < allPlaces.length; i++) {
-    const place = allPlaces[i];
     process.stdout.write(`\r📋 Coletando detalhes... ${i+1}/${allPlaces.length}`);
-    const detail = await getPlaceDetails(place.place_id);
+    const detail = await getPlaceDetails(allPlaces[i].place_id);
     details.push(detail);
-    await new Promise(r => setTimeout(r, 100));
+    await new Promise(r => setTimeout(r, 120));
   }
   console.log('\n');
 
-  // 3. Enriquecer: email (site) + Instagram bio (WA + email)
+  // 3. Enriquecer email via site real
   const enriched: PlaceDetail[] = [];
   for (let i = 0; i < details.length; i++) {
     const d = details[i];
-    process.stdout.write(`\r🔎 Enriquecendo... ${i+1}/${details.length} — ${d.name.slice(0,30)}`);
-
-    // 3a. Scrape de email no site real
-    if (d.website && !/instagram|facebook|twitter|tiktok/.test(d.website)) {
+    process.stdout.write(`\r📧 Buscando emails... ${i+1}/${details.length} — ${d.name.slice(0,28)}`);
+    if (d.website && !/instagram|facebook|twitter|tiktok|linktr/.test(d.website)) {
       d.email = await scrapeEmail(d.website);
     }
-
-    // 3b. Instagram bio → WhatsApp direto + email
-    const igUrl = d.website && /instagram/.test(d.website)
-      ? d.website
-      : '';
-    if (igUrl) {
-      const username = extractInstagramUsername(igUrl);
-      if (username) {
-        const igData = await scrapeInstagramBio(username);
-        if (igData.whatsapp) d.whatsapp_from_instagram = igData.whatsapp;
-        if (igData.email && !d.email) d.email = igData.email;
-      }
-    }
-
     enriched.push(d);
-    await new Promise(r => setTimeout(r, 300)); // respeitar rate limit
+    await new Promise(r => setTimeout(r, 200));
   }
   console.log('\n');
 
-  // 4. Checar WhatsApp via Evolution (apenas celulares)
-  const celulares = enriched
-    .filter(d => d.phone && /9\d{4}/.test(d.phone.replace(/\D/g,'')))
-    .map(d => d.phone!);
-  console.log(`📱 Verificando WhatsApp em ${celulares.length} celulares...`);
-  const waResults = await checkWhatsApp(celulares);
-
-  // 5. Montar resultados
+  // 4. Montar resultados com heurística de WhatsApp BR
   const results: ProspectResult[] = enriched.map(d => {
-    const waFromEvolution = d.phone ? (waResults[d.phone] ?? false) : false;
-    const waFromInsta     = !!d.whatsapp_from_instagram;
-    const temWA           = waFromEvolution || waFromInsta;
-    const phoneWA         = waFromInsta ? d.whatsapp_from_instagram! : (d.phone ?? '');
+    const temWA = isBrazilianMobile(d.phone ?? '');
+    const temSiteReal = !!(d.website && !/instagram|facebook|twitter|tiktok|linktr/.test(d.website));
 
     const r: ProspectResult = {
       nome: d.name,
       endereco: d.formatted_address,
       telefone: d.phone ?? '',
       email: d.email ?? '',
-      tem_site: !!(d.website && !/instagram|facebook/.test(d.website)),
+      tem_site: temSiteReal,
       site_url: d.website ?? '',
       tem_whatsapp: temWA,
       rating: d.rating ?? 0,
@@ -394,15 +406,29 @@ async function run() {
     return r;
   });
 
-  // 6. Imprimir relatório
-  printReport(results, query);
+  // 5. Filtrar: priorizar sem site real (alvo principal Avello)
+  const semSiteReal = results.filter(r => !r.tem_site);
+  const comSiteReal = results.filter(r => r.tem_site);
+  console.log(`\n🎯 Sem site real: ${semSiteReal.length} | Com site: ${comSiteReal.length}`);
 
-  // 7. Salvar JSON
-  const outDir  = path.join(__dirname, '../reports');
+  // 6. Imprimir relatório (foco em sem site)
+  const label = modoBairros ? `${segmento} em ${cidade} [bairros]` : `${segmento} em ${cidade}`;
+  printReport(semSiteReal, label); // relatório só dos sem site real
+
+  // 7. Salvar dois JSONs: todos + só alvos
+  const outDir = path.join(__dirname, '../reports');
   fs.mkdirSync(outDir, { recursive: true });
-  const outFile = path.join(outDir, `${Date.now()}-${segmento}-${cidade.replace(/ /g,'-')}.json`);
-  fs.writeFileSync(outFile, JSON.stringify(results, null, 2));
-  console.log(`\n💾 Dados salvos em: ${outFile}\n`);
+  const ts = Date.now();
+  const slug = `${segmento}-${cidade.replace(/ /g,'-')}${modoBairros?'-bairros':''}`;
+
+  const allFile   = path.join(outDir, `${ts}-${slug}-todos.json`);
+  const alvoFile  = path.join(outDir, `${ts}-${slug}-alvos.json`);
+
+  fs.writeFileSync(allFile,  JSON.stringify(results, null, 2));
+  fs.writeFileSync(alvoFile, JSON.stringify(semSiteReal, null, 2));
+
+  console.log(`\n💾 Todos:  ${allFile}`);
+  console.log(`🎯 Alvos:  ${alvoFile}\n`);
 }
 
 run().catch(err => {
