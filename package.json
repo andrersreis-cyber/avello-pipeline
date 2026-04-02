@@ -1,0 +1,35 @@
+{
+  "name": "avello-pipeline",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "prospect": "ts-node prospector/index.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/andrersreis-cyber/avello-pipeline.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/andrersreis-cyber/avello-pipeline/issues"
+  },
+  "homepage": "https://github.com/andrersreis-cyber/avello-pipeline#readme",
+  "dependencies": {
+    "@types/cheerio": "^0.22.35",
+    "@types/node": "^25.5.0",
+    "@types/node-fetch": "^2.6.13",
+    "cheerio": "^1.2.0",
+    "dotenv": "^17.4.0",
+    "node-fetch": "^2.7.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.2"
+  }
+}
