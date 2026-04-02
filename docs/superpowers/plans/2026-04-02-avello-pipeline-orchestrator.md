@@ -2,20 +2,21 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Construir um funil de vendas de sites com orquestrador de agentes IA que prospecta leads, faz contato por email e telefone, envia o portfólio da Avello e aquece o lead até o fechamento.
+**Goal:** Construir um funil de vendas de sites com orquestrador de agentes IA que prospecta leads, faz contato por email e WhatsApp, envia o portfólio da Avello e aquece o lead via conversa até o fechamento.
 
-**Architecture:** Um agente orquestrador central (Claude API) coordena 4 sub-agentes especializados — Prospecção, Email, Telefone e Portfolio — cada um executando sua etapa do funil. O estado de cada lead é persistido no Supabase e visível em um dashboard React. Workflows no n8n disparam os agentes nas transições de etapa do funil.
+**Architecture:** Um agente orquestrador central (Claude API) coordena 3 sub-agentes — Email, WhatsApp e Portfolio. O agente de WhatsApp usa Evolution API para enviar mensagens e responder leads de forma conversacional com Claude. O estado de cada lead é persistido no Supabase. Workflows no n8n disparam os agentes nas transições de etapa do funil.
 
-**Tech Stack:** Claude API (orquestrador + agentes), n8n (workflow automation), Supabase (banco + realtime), React + Vite + Shadcn/UI + TypeScript (dashboard CRM), VAPI.ai (agente de voz), Gmail API (email), Google Maps API / Apify (prospecção)
+**Tech Stack:** Claude API (orquestrador + agentes), Evolution API (WhatsApp), n8n (workflow automation), Supabase (banco + realtime), React + Vite + Shadcn/UI + TypeScript (dashboard CRM), Gmail API (email), Google Maps API / Apify (prospecção)
 
 ---
 
 ## Visão do Funil
 
 ```
-[PROSPECÇÃO] → [PRIMEIRO CONTATO EMAIL] → [FOLLOW-UP TELEFONE] → [ENVIO PORTFÓLIO] → [AQUECIMENTO] → [FECHAMENTO]
-     ↓                    ↓                        ↓                      ↓                  ↓               ↓
-  Lead criado       Email enviado            Call realizada         Portfolio visto      Reunião marcada   Cliente!
+[PROSPECÇÃO] → [PRIMEIRO CONTATO EMAIL] → [FOLLOW-UP WHATSAPP] → [ENVIO PORTFÓLIO] → [CONVERSA/AQUECIMENTO] → [FECHAMENTO]
+     ↓                    ↓                        ↓                      ↓                      ↓                    ↓
+  Lead criado       Email enviado          WA mensagem enviada      Portfolio visto        Claude responde          Cliente!
+                                                                                          (conversacional)
 ```
 
 ## Subsistemas (planos separados)
@@ -24,7 +25,7 @@
 |-------|---------|--------|
 | 1 - Prospecção | `2026-04-02-sub1-prospeccao.md` | 🔜 |
 | 2 - Agente Email | `2026-04-02-sub2-email-agent.md` | 🔜 |
-| 3 - Agente Telefone | `2026-04-02-sub3-phone-agent.md` | 🔜 |
+| 3 - Agente WhatsApp | `2026-04-02-sub3-whatsapp-agent.md` | 🔜 |
 | 4 - Dashboard CRM | `2026-04-02-sub4-crm-dashboard.md` | 🔜 |
 | 5 - Portfolio Sender | `2026-04-02-sub5-portfolio.md` | 🔜 |
 
@@ -39,17 +40,17 @@ avello-pipeline/
 │   ├── agents/
 │   │   ├── prospector.ts      # Sub-agente: prospecção de leads
 │   │   ├── email-agent.ts     # Sub-agente: contato por email
-│   │   ├── phone-agent.ts     # Sub-agente: contato por telefone
+│   │   ├── whatsapp-agent.ts  # Sub-agente: conversa WhatsApp (Evolution API)
 │   │   └── portfolio-agent.ts # Sub-agente: envio de portfólio
 │   ├── tools/
 │   │   ├── supabase.ts        # Client Supabase + helpers
 │   │   ├── gmail.ts           # Gmail API helper
-│   │   ├── vapi.ts            # VAPI.ai helper (calls)
+│   │   ├── evolution.ts       # Evolution API helper (WhatsApp)
 │   │   └── maps.ts            # Google Maps API helper
 │   ├── prompts/
 │   │   ├── orchestrator.ts    # System prompt do orquestrador
 │   │   ├── email.ts           # Prompts do agente de email
-│   │   ├── phone.ts           # Prompts do agente de telefone
+│   │   ├── whatsapp.ts        # Prompts do agente WhatsApp (conversacional)
 │   │   └── portfolio.ts       # Prompts do agente de portfólio
 │   └── types.ts               # Tipos compartilhados (Lead, Stage, etc.)
 ├── dashboard/
@@ -154,9 +155,10 @@ GMAIL_CLIENT_SECRET=
 GMAIL_REFRESH_TOKEN=
 GMAIL_FROM=contato@avello.com.br
 
-# VAPI (phone agent)
-VAPI_API_KEY=
-VAPI_PHONE_NUMBER=
+# Evolution API (WhatsApp)
+EVOLUTION_API_URL=http://localhost:8080
+EVOLUTION_API_KEY=
+EVOLUTION_INSTANCE=avello
 
 # Google Maps
 GOOGLE_MAPS_API_KEY=
@@ -718,72 +720,114 @@ git commit -m "feat: agente de email com Claude + Gmail API"
 
 ---
 
-## Task 5: Agente de Telefone (VAPI)
+## Task 5: Agente de WhatsApp (Evolution API)
 
 **Files:**
-- Create: `orchestrator/tools/vapi.ts`
-- Create: `orchestrator/prompts/phone.ts`
-- Create: `orchestrator/agents/phone-agent.ts`
+- Create: `orchestrator/tools/evolution.ts`
+- Create: `orchestrator/prompts/whatsapp.ts`
+- Create: `orchestrator/agents/whatsapp-agent.ts`
 
-- [ ] **Step 1: Criar `orchestrator/tools/vapi.ts`**
+- [ ] **Step 1: Criar `orchestrator/tools/evolution.ts`**
 
 ```typescript
-export async function initiateCall(params: {
-  to: string;
-  assistantId: string;
-  variables: Record<string, string>;
-}): Promise<string> {
-  const res = await fetch('https://api.vapi.ai/call/phone', {
+const BASE_URL = process.env.EVOLUTION_API_URL!;
+const API_KEY  = process.env.EVOLUTION_API_KEY!;
+const INSTANCE = process.env.EVOLUTION_INSTANCE!;
+
+async function evoRequest(path: string, body: unknown): Promise<unknown> {
+  const res = await fetch(`${BASE_URL}${path}`, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${process.env.VAPI_API_KEY}`,
+      apikey: API_KEY,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      phoneNumberId: process.env.VAPI_PHONE_NUMBER,
-      customer: { number: params.to },
-      assistantId: params.assistantId,
-      assistantOverrides: {
-        variableValues: params.variables,
-      },
-    }),
+    body: JSON.stringify(body),
   });
+  if (!res.ok) throw new Error(`Evolution API error [${path}]: ${await res.text()}`);
+  return res.json();
+}
 
-  if (!res.ok) throw new Error(`VAPI error: ${await res.text()}`);
-  const data = await res.json();
-  return data.id;
+export async function sendTextMessage(params: {
+  to: string;   // formato: 5527999999999
+  text: string;
+}): Promise<void> {
+  await evoRequest(`/message/sendText/${INSTANCE}`, {
+    number: params.to,
+    text: params.text,
+  });
+}
+
+export async function sendMediaMessage(params: {
+  to: string;
+  url: string;
+  caption: string;
+  mediaType: 'image' | 'document' | 'video';
+}): Promise<void> {
+  await evoRequest(`/message/sendMedia/${INSTANCE}`, {
+    number: params.to,
+    mediatype: params.mediaType,
+    media: params.url,
+    caption: params.caption,
+  });
 }
 ```
 
-- [ ] **Step 2: Criar `orchestrator/prompts/phone.ts`**
+- [ ] **Step 2: Criar `orchestrator/prompts/whatsapp.ts`**
 
 ```typescript
-export const PHONE_AGENT_PROMPT = `
-Você é a Sofia, assistente da Avello — agência de sites para pequenos negócios.
+export const WHATSAPP_AGENT_PROMPT = `
+Você é a Sofia, assistente da Avello — agência que cria sites profissionais para pequenos negócios.
 
-Tom: amigável, direto, respeitoso. Nunca pressione. Máximo 3 minutos de ligação.
+Tom: informal, direto, humano. Como uma conversa de WhatsApp real.
+Mensagens curtas — máximo 3 linhas por mensagem.
+Nunca use listas ou markdown. Escreva como texto corrido.
+Nunca pressione. Nunca use palavras como "incrível" ou "revolucionário".
 
-Script base:
-1. Se apresentar: "Oi, aqui é a Sofia da Avello. Tudo bem?"
-2. Motivo: "Entramos em contato pois vimos que o {{business}} ainda não tem site e queríamos apresentar uma solução rápida."
-3. Pergunta: "Você tem uns 2 minutinhos pra eu te contar?"
-4. Se sim: mencionar portfólio + preço inicial R$497 + perguntar se pode enviar por WhatsApp
-5. Se não: pedir melhor horário para ligar de volta
+# Contexto da Avello
+- Sites profissionais a partir de R$497
+- Portfólio: ${process.env.AVELLO_PORTFOLIO_URL}
+- Tempo de entrega: 7 dias úteis
 
-Variáveis disponíveis: {{name}}, {{business}}, {{segment}}, {{city}}
+# Sua missão nessa conversa
+1. Se apresentar de forma natural
+2. Mencionar que viu que o negócio ainda não tem site
+3. Perguntar se pode mostrar o portfólio
+4. Responder dúvidas com naturalidade
+5. Quando o lead demonstrar interesse, perguntar se prefere marcar uma conversa rápida
+
+# Regras
+- Se o lead disser que não tem interesse, agradeça e encerre
+- Se perguntar o preço, diga "a partir de R$497 dependendo do que precisar"
+- Se perguntar o prazo, diga "em torno de 7 dias úteis"
+- Nunca invente informações sobre a Avello
+
+Responda APENAS com o texto da próxima mensagem de WhatsApp. Sem JSON. Sem formatação.
 `;
+
+export const WHATSAPP_FIRST_MESSAGE = (lead: {
+  name: string;
+  business: string;
+  segment: string;
+}) => `Oi ${lead.name}! Aqui é a Sofia da Avello 👋
+
+Vi que o ${lead.business} ainda não tem site e queria mostrar o que fazemos por negócios do seu segmento.
+
+Posso te mandar nosso portfólio? Leva 1 minutinho 😊`;
 ```
 
-- [ ] **Step 3: Criar `orchestrator/agents/phone-agent.ts`**
+- [ ] **Step 3: Criar `orchestrator/agents/whatsapp-agent.ts`**
 
 ```typescript
-import { initiateCall } from '../tools/vapi.js';
-import { createInteraction, updateLeadStage } from '../tools/supabase.js';
-import type { Lead, AgentResult } from '../types.js';
+import Anthropic from '@anthropic-ai/sdk';
+import { sendTextMessage } from '../tools/evolution.js';
+import { createInteraction, updateLeadStage, getLeadInteractions } from '../tools/supabase.js';
+import { WHATSAPP_AGENT_PROMPT, WHATSAPP_FIRST_MESSAGE } from '../prompts/whatsapp.js';
+import type { Lead, AgentResult, Interaction } from '../types.js';
 
-const VAPI_ASSISTANT_ID = process.env.VAPI_ASSISTANT_ID ?? '';
+const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-export async function runPhoneAgent(
+// Primeira abordagem — mensagem inicial
+export async function runWhatsappAgent(
   lead: Lead,
   payload: Record<string, unknown>
 ): Promise<AgentResult> {
@@ -791,44 +835,183 @@ export async function runPhoneAgent(
     return { success: false, message: 'Lead sem telefone' };
   }
 
-  const callId = await initiateCall({
-    to: lead.phone,
-    assistantId: VAPI_ASSISTANT_ID,
-    variables: {
+  const isFirstContact = payload.type === 'primeiro_contato';
+
+  let text: string;
+
+  if (isFirstContact) {
+    text = WHATSAPP_FIRST_MESSAGE({
       name: lead.name,
       business: lead.business,
       segment: lead.segment,
-      city: lead.city,
-    },
-  });
+    });
+  } else {
+    // Resposta conversacional baseada no histórico
+    const interactions = await getLeadInteractions(lead.id);
+    const history = buildChatHistory(interactions);
+
+    const response = await claude.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 256,
+      system: WHATSAPP_AGENT_PROMPT,
+      messages: history,
+    });
+
+    text = response.content[0].type === 'text' ? response.content[0].text : '';
+  }
+
+  await sendTextMessage({ to: lead.phone, text });
 
   await createInteraction({
     lead_id: lead.id,
-    type: 'call',
+    type: 'whatsapp',
     direction: 'outbound',
-    content: `Call iniciada via VAPI. ID: ${callId}`,
-    agent_notes: 'Aguardando transcrição do VAPI webhook',
+    content: text,
+    agent_notes: `Tipo: ${payload.type ?? 'follow_up'}`,
     status: 'sent',
   });
 
-  await updateLeadStage(lead.id, 'call_realizada', 20);
+  await updateLeadStage(lead.id, 'email_enviado', 10);
 
-  console.log(`[PhoneAgent] Call iniciada para ${lead.phone} — VAPI ID: ${callId}`);
+  console.log(`[WhatsAppAgent] Mensagem enviada para ${lead.phone}: "${text.slice(0, 60)}..."`);
 
   return {
     success: true,
-    message: `Call iniciada: ${callId}`,
-    next_stage: 'call_realizada',
-    score_delta: 20,
+    message: 'Mensagem WhatsApp enviada',
+    next_stage: 'email_enviado',
+    score_delta: 10,
   };
+}
+
+// Webhook — lead respondeu no WhatsApp
+export async function handleIncomingMessage(params: {
+  leadId: string;
+  incomingText: string;
+  lead: Lead;
+}): Promise<void> {
+  const { leadId, incomingText, lead } = params;
+
+  // Salvar mensagem recebida
+  await createInteraction({
+    lead_id: leadId,
+    type: 'whatsapp',
+    direction: 'inbound',
+    content: incomingText,
+    status: 'delivered',
+  });
+
+  // Buscar histórico completo
+  const interactions = await getLeadInteractions(leadId);
+  const history = buildChatHistory(interactions);
+
+  // Claude responde
+  const response = await claude.messages.create({
+    model: 'claude-opus-4-5',
+    max_tokens: 256,
+    system: WHATSAPP_AGENT_PROMPT,
+    messages: history,
+  });
+
+  const replyText = response.content[0].type === 'text' ? response.content[0].text : '';
+
+  await sendTextMessage({ to: lead.phone!, text: replyText });
+
+  await createInteraction({
+    lead_id: leadId,
+    type: 'whatsapp',
+    direction: 'outbound',
+    content: replyText,
+    agent_notes: 'Resposta automática Claude',
+    status: 'sent',
+  });
+
+  // Aumentar score quando lead responde
+  await updateLeadStage(lead.id, 'aquecendo', 25);
+}
+
+function buildChatHistory(
+  interactions: Interaction[]
+): Array<{ role: 'user' | 'assistant'; content: string }> {
+  return interactions
+    .filter((i) => i.type === 'whatsapp')
+    .map((i) => ({
+      role: i.direction === 'inbound' ? 'user' : 'assistant',
+      content: i.content,
+    }));
 }
 ```
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: Adicionar webhook Evolution no server.ts**
+
+No arquivo `orchestrator/server.ts`, adicionar após o webhook VAPI:
+```typescript
+import { handleIncomingMessage } from './agents/whatsapp-agent.js';
+import { getLead } from './tools/supabase.js';
+
+// Webhook Evolution API — lead respondeu no WhatsApp
+app.post('/api/webhook/evolution', async (req, res) => {
+  const { data } = req.body;
+
+  // Ignorar mensagens do próprio número
+  if (data?.key?.fromMe) return res.json({ ok: true });
+
+  const phone = data?.key?.remoteJid?.replace('@s.whatsapp.net', '');
+  const text  = data?.message?.conversation ?? data?.message?.extendedTextMessage?.text;
+
+  if (!phone || !text) return res.json({ ok: true });
+
+  // Buscar lead pelo telefone
+  const { data: leads } = await supabase
+    .from('leads')
+    .select('*')
+    .eq('phone', phone)
+    .limit(1);
+
+  if (!leads?.length) return res.json({ ok: true });
+
+  await handleIncomingMessage({
+    leadId: leads[0].id,
+    incomingText: text,
+    lead: leads[0],
+  });
+
+  res.json({ ok: true });
+});
+```
+
+- [ ] **Step 5: Configurar webhook na Evolution API**
+
+No painel Evolution API ou via requisição:
+```bash
+curl -X POST "${EVOLUTION_API_URL}/webhook/set/${EVOLUTION_INSTANCE}" \
+  -H "apikey: ${EVOLUTION_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://seu-servidor.com/api/webhook/evolution",
+    "webhook_by_events": false,
+    "webhook_base64": false,
+    "events": ["MESSAGES_UPSERT"]
+  }'
+```
+
+- [ ] **Step 6: Testar envio e resposta**
 
 ```bash
-git add orchestrator/agents/phone-agent.ts orchestrator/tools/vapi.ts orchestrator/prompts/phone.ts
-git commit -m "feat: agente de telefone com VAPI.ai"
+# Enviar primeira mensagem para seu próprio WhatsApp de teste:
+npx ts-node -e "
+import 'dotenv/config';
+import { sendTextMessage } from './orchestrator/tools/evolution.js';
+sendTextMessage({ to: '5527SEU_NUMERO', text: 'Teste Evolution API ✅' });
+"
+```
+
+Esperado: mensagem recebida no WhatsApp.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add orchestrator/agents/whatsapp-agent.ts orchestrator/tools/evolution.ts orchestrator/prompts/whatsapp.ts
+git commit -m "feat: agente WhatsApp conversacional com Evolution API + Claude"
 ```
 
 ---
@@ -969,13 +1152,7 @@ app.post('/api/pipeline/run', async (req, res) => {
   }
 });
 
-// Webhook VAPI — receber transcrição das calls
-app.post('/api/webhook/vapi', async (req, res) => {
-  const { call_id, transcript, summary } = req.body;
-  console.log(`[VAPI Webhook] Call ${call_id}: ${summary}`);
-  // TODO: atualizar interaction com transcrição
-  res.json({ ok: true });
-});
+// Webhook Evolution — lead respondeu no WhatsApp (ver Task 5, Step 4)
 
 app.listen(3000, () => console.log('Avello Pipeline rodando na porta 3000'));
 ```
@@ -1042,7 +1219,7 @@ git commit -m "chore: gitignore + configuração de deploy"
 ### Cobertura da spec:
 - ✅ Prospecção de leads — Task 2 (Supabase) + sub-plano dedicado
 - ✅ Contato por email com agente IA — Task 4
-- ✅ Contato por telefone com agente IA — Task 5
+- ✅ Contato por WhatsApp com agente IA conversacional — Task 5 (Evolution API)
 - ✅ Envio de portfólio — Task 6
 - ✅ Apresentação da Avello — prompts de todos os agentes
 - ✅ Aquecimento do lead — score system + stages
